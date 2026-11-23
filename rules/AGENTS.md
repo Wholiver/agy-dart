@@ -17,7 +17,7 @@
 2. **No blind dumps & long commands**: Never run bare `cat`/`Get-Content`/`type` or stdout `curl`/`wget`. Short `run_command` dev calls (`git`, tests, builds) are compacted <=8.8 KB (indexed in FTS5); >60s or async (`WaitMsBeforeAsync <= 2000`, `IsDaemon: true`) run natively via `run_command`.
 3. **KV-Cache & TTFT hygiene**: Use `SessionStart` snapshot + Core hubs before `ls`/`git status`. Delegate screenshots/images in >150k-token sessions to a text-only subagent. Avoid re-reading unchanged files. Never pause mid-task to ask for `/compact`; keep long tasks continuous and call `ctx_resume` only after user compaction.
 4. **One MCP call/turn & brief subagents**: Pack searches into one `batch_search`, edits + `verify` into one `apply_edits`, and tell subagents to use `agy-dart_fast` or ranged `read_file`.
-5. **Compact `ctx_execute` cards**: Put a short `intent` first; keep inline `code` <=5 lines (~400 chars) — for longer scripts, write to OS temp dir (`/tmp` or `$TEMP`, not the repo) and pass `file` + `args`.
+5. **Compact `ctx_execute` cards**: Put a short `intent` first; keep inline `code` <=5 lines (~400 chars) — for longer scripts, write to `<Artifact Directory Path>/scratch/...` (`<appDataDir>/brain/<conversation-id>/scratch/...` in Antigravity, or absolute OS temp `/tmp/...` / `.../AppData/Local/Temp/...` elsewhere; never the repo) and pass `file` + `args`.
 
 ## Inline Schemas (<=8.8 KB)
 **`agy-dart_fast`**:

@@ -87,9 +87,33 @@ function resolveDirectoryCandidate(raw) {
 
 function isExplicitAbsoluteCwdArg(raw) {
   if (typeof raw !== "string") return false;
-  const s = raw.trim();
+  let s = raw.trim();
+  while (s.length >= 2) {
+    const q = s[0];
+    if ((q === '"' || q === "'") && s[s.length - 1] === q) {
+      const inner = s.slice(1, -1);
+      if (inner.includes(q)) break;
+      s = inner.trim();
+      continue;
+    }
+    break;
+  }
   if (!s) return false;
-  if (/^file:\/\//i.test(s) || s === "~" || s.startsWith("~/") || s.startsWith("~\\")) return true;
+  if (/^file:\/\//i.test(s)) {
+    try {
+      return path.isAbsolute(fileURLToPath(s));
+    } catch {
+      return false;
+    }
+  }
+  if (
+    s === "~" ||
+    s.startsWith("~/") ||
+    s.startsWith("~\\") ||
+    /^(?:\$\{(?:env:)?(?:TMPDIR|TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)\}|\$(?:env:)?(?:TMPDIR|TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)|%(?:TEMP|TMP|HOME|USERPROFILE|LOCALAPPDATA)%)(?=$|[\\/])/i.test(s)
+  ) {
+    return true;
+  }
   return path.isAbsolute(s);
 }
 
@@ -192,17 +216,17 @@ const RAW_TOOL_DEFINITIONS = [
   },
   {
     name: "ctx_execute",
-    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5). Pass short intent first; for >5-line scripts, write to OS temp dir and pass file + args.",
+    description: "Run JS/Python/Shell/PowerShell in sandbox to filter >16 KB logs or giant JSON/CSV/API data (<=8.8 KB inline + FTS5). Pass short intent first; for >5-line scripts, write to conversation scratch dir (or OS temp) and pass file + args.",
     inputSchema: {
       type: "object",
       properties: {
+        intent: { type: "string" },
         language: { type: "string", enum: ["javascript", "nodejs", "python", "shell", "powershell", "cmd"] },
         code: { type: "string" },
         file: { type: "string" },
-        sessionId: { type: "string" },
         args: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
-        intent: { type: "string" },
+        sessionId: { type: "string" },
         timeoutSec: { type: "integer", minimum: 1, maximum: 300 }
       }
     }

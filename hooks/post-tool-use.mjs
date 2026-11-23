@@ -100,6 +100,45 @@ function cleanPath(val) {
   return p.trim();
 }
 
+function expandHookPath(val) {
+  const p = cleanPath(val);
+  if (!p) return "";
+  const joinExpandedTail = (base, rawTail) => {
+    const segs = String(rawTail || "").split(/[\\/]+/).filter(Boolean);
+    return segs.length > 0 ? path.join(base, ...segs) : base;
+  };
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) {
+    return joinExpandedTail(os.homedir(), p.slice(2));
+  }
+  const tmpMatch = p.match(
+    /^(?:\$\{(?:env:)?(?:TMPDIR|TEMP|TMP)\}|\$(?:env:)?(?:TMPDIR|TEMP|TMP)|%(?:TEMP|TMP)%)(?=$|[\\/])(.*)$/i
+  );
+  if (tmpMatch) {
+    return joinExpandedTail(os.tmpdir(), tmpMatch[1]);
+  }
+  const homeMatch = p.match(
+    /^(?:\$\{(?:env:)?(?:HOME|USERPROFILE)\}|\$(?:env:)?(?:HOME|USERPROFILE)|%(?:HOME|USERPROFILE)%)(?=$|[\\/])(.*)$/i
+  );
+  if (homeMatch) {
+    return joinExpandedTail(os.homedir(), homeMatch[1]);
+  }
+  const localAppMatch = p.match(
+    /^(?:\$\{(?:env:)?LOCALAPPDATA\}|\$(?:env:)?LOCALAPPDATA|%LOCALAPPDATA%)(?=$|[\\/])(.*)$/i
+  );
+  if (localAppMatch) {
+    const base = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return joinExpandedTail(base, localAppMatch[1]);
+  }
+  return p;
+}
+
+function stripHostNamespace(rawToolName) {
+  const s = String(rawToolName || "").trim();
+  const colonIdx = s.lastIndexOf(":");
+  return colonIdx >= 0 ? s.slice(colonIdx + 1) : s;
+}
+
 function parseMaybeJson(val) {
   if (!val) return null;
   if (typeof val === "object") return val;
@@ -116,28 +155,29 @@ function parseMaybeJson(val) {
 export function extractInvalidationTargets(toolName, args = {}, cwd = process.cwd()) {
   const paths = [];
   let clearAllSession = false;
+  const bareTool = stripHostNamespace(toolName);
 
   const addPath = (raw, baseDir = cwd) => {
-    const cleaned = cleanPath(raw);
+    const cleaned = expandHookPath(raw);
     if (!cleaned) return;
     paths.push(path.isAbsolute(cleaned) ? path.normalize(cleaned) : path.resolve(baseDir || cwd, cleaned));
   };
 
   const resolveBaseCwd = (rawCwd) => {
-    const cleaned = cleanPath(rawCwd);
+    const cleaned = expandHookPath(rawCwd);
     if (!cleaned) return cwd;
     return path.isAbsolute(cleaned) ? path.normalize(cleaned) : path.resolve(cwd, cleaned);
   };
 
   if (
-    toolName === "edit_file" ||
-    toolName === "write_file" ||
-    toolName === "replace_file_content" ||
-    toolName === "multi_replace_file_content" ||
-    toolName === "write_to_file"
+    bareTool === "edit_file" ||
+    bareTool === "write_file" ||
+    bareTool === "replace_file_content" ||
+    bareTool === "multi_replace_file_content" ||
+    bareTool === "write_to_file"
   ) {
     addPath(args.Path || args.path || args.TargetFile || args.targetFile || args.filePath || args.AbsolutePath || args.absolutePath);
-  } else if (toolName === "apply_edits" || /(?:^|_)apply_edits$/.test(toolName)) {
+  } else if (bareTool === "apply_edits" || /(?:^|_)apply_edits$/.test(bareTool)) {
     if (!args.dryRun) {
       const editCwd = resolveBaseCwd(args.cwd);
       const editsList = Array.isArray(args.edits) ? args.edits : parseMaybeJson(args.edits);
@@ -147,10 +187,10 @@ export function extractInvalidationTargets(toolName, args = {}, cwd = process.cw
         }
       }
     }
-  } else if (toolName === "call_mcp_tool") {
-    const mcpTool = String(args.ToolName || args.toolName || "").trim();
+  } else if (bareTool === "call_mcp_tool") {
+    const mcpTool = stripHostNamespace(cleanPath(args.ToolName || args.toolName || ""));
     const mcpArgs = parseMaybeJson(args.Arguments ?? args.arguments) || {};
-    if (mcpTool === "apply_edits") {
+    if (mcpTool === "apply_edits" || /(?:^|_)apply_edits$/.test(mcpTool)) {
       if (!mcpArgs.dryRun) {
         const editCwd = resolveBaseCwd(mcpArgs.cwd);
         const editsList = Array.isArray(mcpArgs.edits) ? mcpArgs.edits : parseMaybeJson(mcpArgs.edits);
@@ -160,18 +200,344 @@ export function extractInvalidationTargets(toolName, args = {}, cwd = process.cw
           }
         }
       }
-    } else if (mcpTool === "ctx_resume") {
+    } else if (mcpTool === "ctx_resume" || /(?:^|_)ctx_resume$/.test(mcpTool)) {
       if (mcpArgs.seq === undefined || mcpArgs.seq === null) {
         clearAllSession = true;
       }
     }
-  } else if (toolName === "ctx_resume" || /(?:^|_)ctx_resume$/.test(toolName)) {
+  } else if (bareTool === "ctx_resume" || /(?:^|_)ctx_resume$/.test(bareTool)) {
     if (args.seq === undefined || args.seq === null) {
       clearAllSession = true;
     }
   }
 
   return { paths, clearAllSession };
+}
+
+const UUID_SEGMENT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const GENERIC_NON_CONV_SEGMENTS = new Set([
+  "default",
+  "all",
+  "app",
+  "lifetime",
+  "main",
+  "master",
+  "test",
+  "tests",
+  "core",
+  "util",
+  "utils",
+  "src",
+  "lib",
+  "dist",
+  "build",
+  "docs",
+  "scripts"
+]);
+const SOURCE_TREE_PARENT_SEGMENTS = new Set([
+  "src",
+  "lib",
+  "app",
+  "packages",
+  "modules",
+  "components",
+  "services",
+  "server",
+  "client",
+  "node_modules",
+  "vendor",
+  "test",
+  "tests"
+]);
+
+function resolveRealPathBestEffort(resolvedPath) {
+  try {
+    return fs.realpathSync(resolvedPath);
+  } catch {
+    let cur = path.dirname(resolvedPath);
+    const tail = [path.basename(resolvedPath)];
+    for (let i = 0; i < 16 && cur; i += 1) {
+      try {
+        const realCur = fs.realpathSync(cur);
+        return path.join(realCur, ...tail.reverse());
+      } catch {
+        const parent = path.dirname(cur);
+        if (!parent || parent === cur) break;
+        tail.push(path.basename(cur));
+        cur = parent;
+      }
+    }
+    return null;
+  }
+}
+
+function isWinDriveLike(p) {
+  return typeof p === "string" && /^\/?[A-Za-z]:(?:$|[\\/])/.test(p);
+}
+
+function normalizeWinDriveToSyntheticPosix(rawWinPath) {
+  const s = rawWinPath.startsWith("/") ? rawWinPath.slice(1) : rawWinPath;
+  const drive = s[0].toLowerCase();
+  const rest = s.slice(2).replace(/\\/g, "/");
+  const normRest = path.posix.normalize("/" + rest).toLowerCase();
+  return normRest === "/" ? `/${drive}:` : `/${drive}:${normRest.replace(/\/+$/, "")}`;
+}
+
+function resolvePathBundle(rawPath, baseDir = "", { platform = process.platform } = {}) {
+  const cleaned = expandHookPath(rawPath);
+  if (!cleaned) return null;
+  const effPlatform = platform || process.platform;
+
+  if (effPlatform !== "win32" && isWinDriveLike(cleaned)) {
+    const winPosix = normalizeWinDriveToSyntheticPosix(cleaned);
+    return { logical: winPosix, real: winPosix, allForms: [winPosix] };
+  }
+
+  if (effPlatform !== process.platform) {
+    const cleanedBase = expandHookPath(baseDir);
+    if (effPlatform !== "win32") {
+      const candPosix = cleaned.replace(/\\/g, "/");
+      const basePosix = cleanedBase && !isWinDriveLike(cleanedBase) ? cleanedBase.replace(/\\/g, "/") : "";
+      const resolved =
+        !path.posix.isAbsolute(candPosix) && basePosix
+          ? path.posix.resolve(basePosix, candPosix)
+          : path.posix.resolve("/", candPosix);
+      return { logical: resolved, real: resolved, allForms: [resolved] };
+    }
+    const resolvedWin = (
+      !path.win32.isAbsolute(cleaned) && cleanedBase
+        ? path.win32.resolve(cleanedBase, cleaned)
+        : path.win32.resolve(cleaned)
+    ).toLowerCase();
+    return { logical: resolvedWin, real: resolvedWin, allForms: [resolvedWin] };
+  }
+
+  const cleanedBase = expandHookPath(baseDir);
+  const resolved =
+    !path.isAbsolute(cleaned) && cleanedBase ? path.resolve(cleanedBase, cleaned) : path.resolve(cleaned);
+  const normCase = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const logical = normCase(resolved);
+  const realRaw = resolveRealPathBestEffort(resolved);
+  const real = realRaw ? normCase(realRaw) : logical;
+  const allForms = real !== logical ? [logical, real] : [logical];
+  return { logical, real, allForms };
+}
+
+function relativeBetweenForms(dirForm, candForm) {
+  if (dirForm.startsWith("/") && candForm.startsWith("/")) {
+    return path.posix.relative(dirForm, candForm);
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(dirForm) && /^[a-zA-Z]:[\\/]/.test(candForm)) {
+    return path.win32.relative(dirForm, candForm);
+  }
+  return path.relative(dirForm, candForm);
+}
+
+function isSameOrInsideAnyDir(candForms, dirForms, { strictChild = false } = {}) {
+  for (const c of candForms) {
+    for (const d of dirForms) {
+      if (!c || !d) continue;
+      const rel = relativeBetweenForms(d, c);
+      if (rel === "") {
+        if (!strictChild) return true;
+        continue;
+      }
+      if (
+        rel !== ".." &&
+        !rel.startsWith(`..${path.sep}`) &&
+        !rel.startsWith("../") &&
+        !rel.startsWith("..\\") &&
+        !path.posix.isAbsolute(rel) &&
+        !path.win32.isAbsolute(rel)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isInsideBrainConversationSubdir(candForms, brainDirForms) {
+  for (const c of candForms) {
+    for (const d of brainDirForms) {
+      if (!c || !d) continue;
+      const rel = relativeBetweenForms(d, c);
+      if (
+        !rel ||
+        rel === ".." ||
+        rel.startsWith(`..${path.sep}`) ||
+        rel.startsWith("../") ||
+        rel.startsWith("..\\") ||
+        path.posix.isAbsolute(rel) ||
+        path.win32.isAbsolute(rel)
+      ) {
+        continue;
+      }
+      const parts = rel.split(/[\\/]+/).filter(Boolean);
+      if (parts.length >= 2 && parts[0] !== "." && parts[0] !== "..") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isAbsoluteForAnyOs(p) {
+  return Boolean(p && (path.isAbsolute(p) || path.posix.isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p)));
+}
+
+function pathModFor(p) {
+  return /^[A-Za-z]:[\\/]/.test(p) ? path.win32 : path.posix.isAbsolute(p) && process.platform === "win32" && !p.startsWith("\\\\") ? path.posix : path;
+}
+
+export function isEphemeralOsTempPathOutsideWorkspace(absPath, workspaceCwd = "", options = {}) {
+  const effPlatform = options?.platform || process.platform;
+  const candBundle = resolvePathBundle(absPath, workspaceCwd, { platform: effPlatform });
+  if (!candBundle) return false;
+  if (workspaceCwd && typeof workspaceCwd === "string" && workspaceCwd.trim()) {
+    const wsBundle = resolvePathBundle(workspaceCwd, "", { platform: effPlatform });
+    if (wsBundle && isSameOrInsideAnyDir(candBundle.allForms, wsBundle.allForms)) {
+      return false;
+    }
+  }
+  const rawTmpCandidates = [
+    os.tmpdir(),
+    process.env.TMPDIR,
+    process.env.TEMP,
+    process.env.TMP,
+    ...(effPlatform !== "win32" ? ["/tmp", "/private/tmp", "/var/tmp"] : [])
+  ];
+  // Require the canonical real target (`candBundle.real`) to reside inside an OS temp dir so a
+  // symlink/junction inside %TEMP% or /tmp pointing to an external repo file is never excluded.
+  for (const tmpCand of rawTmpCandidates) {
+    if (!tmpCand || typeof tmpCand !== "string" || !tmpCand.trim() || !isAbsoluteForAnyOs(tmpCand.trim())) {
+      continue;
+    }
+    const tmpBundle = resolvePathBundle(tmpCand, "", { platform: effPlatform });
+    if (tmpBundle && isSameOrInsideAnyDir([candBundle.real], tmpBundle.allForms, { strictChild: true })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isAntigravityBrainPathOutsideWorkspace(absPath, workspaceCwd = "", options = {}) {
+  const effPlatform = options?.platform || process.platform;
+  const candBundle = resolvePathBundle(absPath, workspaceCwd, { platform: effPlatform });
+  if (!candBundle) return false;
+  if (workspaceCwd && typeof workspaceCwd === "string" && workspaceCwd.trim()) {
+    const wsBundle = resolvePathBundle(workspaceCwd, "", { platform: effPlatform });
+    if (wsBundle && isSameOrInsideAnyDir(candBundle.allForms, wsBundle.allForms)) {
+      return false;
+    }
+  }
+
+  const knownBrainDirCandidates = [];
+  const pushBrainDir = (rawDir) => {
+    const cleaned = expandHookPath(rawDir);
+    if (cleaned && isAbsoluteForAnyOs(cleaned)) {
+      knownBrainDirCandidates.push(cleaned);
+    }
+  };
+
+  for (const appDir of [
+    options?.appDataDir,
+    process.env.ANTIGRAVITY_APP_DATA_DIR,
+    process.env.ANTIGRAVITY_DATA_DIR,
+    process.env.AGY_APP_DATA_DIR
+  ]) {
+    const cleanedApp = expandHookPath(appDir);
+    if (cleanedApp && isAbsoluteForAnyOs(cleanedApp)) {
+      pushBrainDir(pathModFor(cleanedApp).join(cleanedApp, "brain"));
+    }
+  }
+  const summaryDbEnv = expandHookPath(options?.summaryDbPath || process.env.AGY_DART_SUMMARY_DB_PATH);
+  if (summaryDbEnv && isAbsoluteForAnyOs(summaryDbEnv)) {
+    const pm = pathModFor(summaryDbEnv);
+    pushBrainDir(pm.join(pm.dirname(summaryDbEnv), "brain"));
+  }
+  const txPath = expandHookPath(options?.transcriptPath);
+  if (txPath && isAbsoluteForAnyOs(txPath)) {
+    const pm = pathModFor(txPath);
+    let cur = pm.dirname(txPath);
+    for (let depth = 0; depth < 7 && cur; depth += 1) {
+      if (pm.basename(cur).toLowerCase() === "brain") {
+        pushBrainDir(cur);
+        break;
+      }
+      const next = pm.dirname(cur);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+  }
+  for (const homeCand of [os.homedir(), process.env.USERPROFILE, process.env.HOME]) {
+    const cleanedHome = expandHookPath(homeCand);
+    if (cleanedHome && isAbsoluteForAnyOs(cleanedHome)) {
+      const pm = pathModFor(cleanedHome);
+      pushBrainDir(pm.join(cleanedHome, ".gemini", "antigravity", "brain"));
+      pushBrainDir(pm.join(cleanedHome, ".gemini", "antigravity-ide", "brain"));
+      pushBrainDir(pm.join(cleanedHome, ".gemini", "antigravity-cli", "brain"));
+    }
+  }
+
+  // Require the canonical target (`candBundle.real`) to remain inside `<brain>/<convId>/...` so
+  // symlinks/junctions inside `brain/<convId>/scratch/` pointing to external repos are not excluded.
+  for (const brainCand of knownBrainDirCandidates) {
+    const brainBundle = resolvePathBundle(brainCand, "", { platform: effPlatform });
+    if (brainBundle && isInsideBrainConversationSubdir([candBundle.real], brainBundle.allForms)) {
+      return true;
+    }
+  }
+
+  const activeConvIds = new Set();
+  const rawConvList = Array.isArray(options?.conversationIds) ? options.conversationIds : [];
+  for (const rawId of rawConvList) {
+    if (typeof rawId !== "string") continue;
+    const trimmed = rawId.trim();
+    if (!trimmed || trimmed.length < 4 || trimmed.length > 128 || /[\x00-\x1f\x7f\\/]/.test(trimmed)) continue;
+    const lower = trimmed.toLowerCase();
+    if (GENERIC_NON_CONV_SEGMENTS.has(lower)) continue;
+    activeConvIds.add(effPlatform === "win32" ? lower : trimmed);
+    activeConvIds.add(lower);
+  }
+
+  const isAntigravityHostSeg = (seg) => seg === "antigravity" || /^antigravity-[a-z0-9._-]+$/i.test(seg);
+
+  for (const cand of candBundle.allForms) {
+    const segs = cand.replace(/\\/g, "/").split("/");
+    for (let i = 0; i < segs.length; i += 1) {
+      if (segs[i].toLowerCase() !== "brain") continue;
+      const convSeg = segs[i + 1] || "";
+      if (!convSeg || convSeg === "." || convSeg === ".." || convSeg.length > 128) continue;
+      const hasChildFile = segs.slice(i + 2).some(Boolean);
+      if (!hasChildFile) continue;
+
+      const prev1 = (segs[i - 1] || "").toLowerCase();
+      const prev2 = (segs[i - 2] || "").toLowerCase();
+      const hasAgAncestry =
+        prev1 === ".gemini" || isAntigravityHostSeg(prev1) || isAntigravityHostSeg(prev2);
+      const isUuidConv = UUID_SEGMENT_RE.test(convSeg);
+      const isActiveConv =
+        !SOURCE_TREE_PARENT_SEGMENTS.has(prev1) &&
+        (activeConvIds.has(convSeg) || activeConvIds.has(convSeg.toLowerCase()));
+      if (!hasAgAncestry && !isUuidConv && !isActiveConv) continue;
+
+      const matchedBrainPrefix = segs.slice(0, i + 1).join("/") || "/";
+      const matchedBrainBundle = resolvePathBundle(matchedBrainPrefix, "", { platform: effPlatform });
+      if (matchedBrainBundle && isInsideBrainConversationSubdir([candBundle.real], matchedBrainBundle.allForms)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+export function isEphemeralScratchOrTempPathOutsideWorkspace(absPath, workspaceCwd = "", options = {}) {
+  return (
+    isEphemeralOsTempPathOutsideWorkspace(absPath, workspaceCwd, options) ||
+    isAntigravityBrainPathOutsideWorkspace(absPath, workspaceCwd, options)
+  );
 }
 
 function extractResponseIsError(payload = {}) {
@@ -201,13 +567,14 @@ function extractPartialAppliedPaths(responseText, toolName, args = {}, cwd = pro
 
   let baseCwd = cwd;
   const resolveBase = (rawCwd) => {
-    const cleaned = cleanPath(rawCwd);
+    const cleaned = expandHookPath(rawCwd);
     if (!cleaned) return cwd;
     return path.isAbsolute(cleaned) ? path.normalize(cleaned) : path.resolve(cwd, cleaned);
   };
-  if (toolName === "apply_edits" || /(?:^|_)apply_edits$/.test(toolName)) {
+  const bareTool = stripHostNamespace(toolName);
+  if (bareTool === "apply_edits" || /(?:^|_)apply_edits$/.test(bareTool)) {
     baseCwd = resolveBase(args.cwd);
-  } else if (toolName === "call_mcp_tool") {
+  } else if (bareTool === "call_mcp_tool") {
     const mcpArgs = parseMaybeJson(args.Arguments ?? args.arguments) || {};
     baseCwd = resolveBase(mcpArgs.cwd);
   }
@@ -216,7 +583,7 @@ function extractPartialAppliedPaths(responseText, toolName, args = {}, cwd = pro
   for (const line of appliedBlockMatch[1].split(/\r?\n/)) {
     const m = line.match(/^\s*-\s+(.+?):\s+(?:created|updated\b)/i);
     if (!m) continue;
-    const cleaned = cleanPath(m[1]);
+    const cleaned = expandHookPath(m[1]);
     if (!cleaned) continue;
     out.push(path.isAbsolute(cleaned) ? path.normalize(cleaned) : path.resolve(baseCwd, cleaned));
   }
@@ -256,9 +623,10 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
   let verifyCmd = "";
   let isRunChecks = false;
   let runChecksCmd = "";
-  if (toolName === "apply_edits" || /(?:^|_)apply_edits$/.test(toolName)) {
+  const bareTool = stripHostNamespace(toolName);
+  if (bareTool === "apply_edits" || /(?:^|_)apply_edits$/.test(bareTool)) {
     verifyCmd = typeof args.verify === "string" ? args.verify : args.verify?.command || "";
-  } else if (toolName === "run_checks" || /(?:^|_)run_checks$/.test(toolName)) {
+  } else if (bareTool === "run_checks" || /(?:^|_)run_checks$/.test(bareTool)) {
     isRunChecks = true;
     const parsedCmds = Array.isArray(args.commands) ? args.commands : parseMaybeJson(args.commands);
     const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
@@ -267,12 +635,12 @@ export function extractVerificationSignal(toolName, args = {}, responseText = ""
       .filter(Boolean)
       .slice(0, 3)
       .join(", ");
-  } else if (toolName === "call_mcp_tool") {
-    const mcpTool = String(args.ToolName || args.toolName || "").trim();
+  } else if (bareTool === "call_mcp_tool") {
+    const mcpTool = stripHostNamespace(cleanPath(args.ToolName || args.toolName || ""));
     const mcpArgs = parseMaybeJson(args.Arguments ?? args.arguments) || {};
-    if (mcpTool === "apply_edits") {
+    if (mcpTool === "apply_edits" || /(?:^|_)apply_edits$/.test(mcpTool)) {
       verifyCmd = typeof mcpArgs.verify === "string" ? mcpArgs.verify : mcpArgs.verify?.command || "";
-    } else if (mcpTool === "run_checks") {
+    } else if (mcpTool === "run_checks" || /(?:^|_)run_checks$/.test(mcpTool)) {
       isRunChecks = true;
       const parsedCmds = Array.isArray(mcpArgs.commands) ? mcpArgs.commands : parseMaybeJson(mcpArgs.commands);
       const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
@@ -348,6 +716,24 @@ async function main() {
   const cwd = payload.cwd || process.cwd();
   const sessionId = resolveSessionId(payload);
   const directConvId = resolveDirectConversationId(payload);
+  const rawTranscriptPath =
+    (typeof payload.transcriptPath === "string" && payload.transcriptPath.trim()) ||
+    (typeof payload.transcript_path === "string" && payload.transcript_path.trim()) ||
+    (typeof payload.common?.transcriptPath === "string" && payload.common.transcriptPath.trim()) ||
+    (typeof payload.common?.transcript_path === "string" && payload.common.transcript_path.trim()) ||
+    "";
+  const payloadConvIds = [
+    sessionId,
+    directConvId,
+    payload.rootConversationId,
+    payload.root_conversation_id,
+    payload.parentConversationId,
+    payload.parent_conversation_id,
+    payload.conversationId,
+    payload.conversation_id,
+    payload.common?.conversationId,
+    payload.common?.conversation_id
+  ].filter(Boolean);
 
   const { paths, clearAllSession } = extractInvalidationTargets(toolName, args, cwd);
   const responseText = extractToolResponseText(payload);
@@ -389,22 +775,60 @@ async function main() {
             ));
         const effectivePaths = partialApplied !== null ? partialApplied : abortedNoWrite ? [] : paths;
         if (effectivePaths.length > 0) {
-          for (const absPath of effectivePaths) {
-            store.invalidateFileReads(sessionId, absPath);
+          const invalidateSinglePath = (target) => {
+            store.invalidateFileReads(sessionId, target);
             if (typeof store.clearGhostInterception === "function") {
-              store.clearGhostInterception(sessionId, absPath);
+              store.clearGhostInterception(sessionId, target);
             }
             if (directConvId && directConvId !== sessionId) {
-              store.invalidateFileReads(directConvId, absPath);
+              store.invalidateFileReads(directConvId, target);
               if (typeof store.clearGhostInterception === "function") {
-                store.clearGhostInterception(directConvId, absPath);
+                store.clearGhostInterception(directConvId, target);
               }
             }
             if (typeof store.invalidateFileReadsByPath === "function") {
-              store.invalidateFileReadsByPath(absPath);
+              store.invalidateFileReadsByPath(target);
+            }
+          };
+          for (const absPath of effectivePaths) {
+            invalidateSinglePath(absPath);
+            const realTarget = resolveRealPathBestEffort(absPath);
+            if (
+              realTarget &&
+              (process.platform === "win32"
+                ? realTarget.toLowerCase() !== absPath.toLowerCase()
+                : realTarget !== absPath)
+            ) {
+              invalidateSinglePath(realTarget);
             }
           }
-          store.recordModifiedFiles(sessionId, effectivePaths, { worktree: cwd, tool: toolName });
+          const wsLogicalForm =
+            cwd && typeof cwd === "string" && cwd.trim()
+              ? (process.platform === "win32" ? path.resolve(cwd).toLowerCase() : path.resolve(cwd))
+              : "";
+          const checkpointPaths = effectivePaths
+            .filter(
+              (absPath) =>
+                !isEphemeralScratchOrTempPathOutsideWorkspace(absPath, cwd, {
+                  conversationIds: payloadConvIds,
+                  transcriptPath: rawTranscriptPath
+                })
+            )
+            .map((absPath) => {
+              const absForm = process.platform === "win32" ? absPath.toLowerCase() : absPath;
+              if (wsLogicalForm && isSameOrInsideAnyDir([absForm], [wsLogicalForm])) {
+                return absPath;
+              }
+              const realTarget = resolveRealPathBestEffort(absPath);
+              return realTarget || absPath;
+            });
+          if (checkpointPaths.length > 0) {
+            const realCwd = resolveRealPathBestEffort(cwd) || cwd;
+            store.recordModifiedFiles(sessionId, checkpointPaths, {
+              worktree: wsLogicalForm ? cwd : realCwd,
+              tool: toolName
+            });
+          }
         }
       }
       if (verifySignal) {

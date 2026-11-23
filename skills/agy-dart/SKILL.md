@@ -26,15 +26,16 @@ For logs, test dumps, CSV/JSON files, or API responses larger than 16 KB, extrac
     "timeoutSec": 120
   }
   ```
-- **Multi-line scripts (`> 5 lines` / `> ~400 chars`)**: Write the script to an OS temp file first (e.g. `/tmp/agy_ctx_trace.py` or `$TEMP/agy_ctx_trace.py`, outside the repo so `git status` stays clean) and pass `file` + `args` instead of embedding a large `code` block in MCP arguments:
+- **Multi-line scripts (`> 5 lines` / `> ~400 chars`)**: In Antigravity (including SSH-Remote WSL and `Non-Workspace File Access: ask | deny`), write the script to the conversation's built-in scratch directory first (`<Artifact Directory Path>/scratch/agy_ctx_trace.py`, i.e. `<appDataDir>/brain/<conversation-id>/scratch/agy_ctx_trace.py`) so `write_file` stays inside the pre-authorized conversation folder without triggering non-workspace permission prompts. On non-Antigravity hosts, write to a concrete absolute OS temp path (e.g. `/tmp/agy_ctx_trace.py` on Linux/macOS or `C:/Users/<user>/AppData/Local/Temp/agy_ctx_trace.py` on Windows — never pass unexpanded `$TEMP/...` to `write_file`, and keep temp scripts outside the repo so `git status` stays clean). Then pass `file` + `args` instead of embedding a large `code` block in MCP arguments:
   ```json
   {
     "intent": "Analyze slow queries in trace.json",
     "language": "python",
-    "file": "/tmp/agy_ctx_trace.py",
+    "file": "/home/<user>/.gemini/antigravity/brain/<conversation-id>/scratch/agy_ctx_trace.py",
     "args": ["trace.json"]
   }
   ```
+  *(On non-Antigravity hosts without `brain/<conversation-id>/scratch/`, pass `"file": "/tmp/agy_ctx_trace.py"` or the concrete Windows `AppData/Local/Temp/...` path.)*
 
 ## 2. Heading-Aware Docs & URLs (`ctx_index` + `ctx_search`)
 

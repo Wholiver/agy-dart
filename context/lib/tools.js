@@ -37,7 +37,21 @@ function normalizeExplicitSessionId(raw) {
 function expandArgPath(raw) {
   if (typeof raw !== "string") return "";
   let s = raw.trim();
+  while (s.length >= 2) {
+    const q = s[0];
+    if ((q === '"' || q === "'") && s[s.length - 1] === q) {
+      const inner = s.slice(1, -1);
+      if (inner.includes(q)) break;
+      s = inner.trim();
+      continue;
+    }
+    break;
+  }
   if (!s) return "";
+  const joinExpandedTail = (base, rawTail) => {
+    const segs = String(rawTail || "").split(/[\\/]+/).filter(Boolean);
+    return segs.length > 0 ? path.join(base, ...segs) : base;
+  };
   if (/^file:\/\//i.test(s)) {
     try {
       s = fileURLToPath(s);
@@ -47,14 +61,28 @@ function expandArgPath(raw) {
   } else if (s === "~") {
     s = os.homedir();
   } else if (s.startsWith("~/") || s.startsWith("~\\")) {
-    s = path.join(os.homedir(), s.slice(2));
+    s = joinExpandedTail(os.homedir(), s.slice(2));
   } else {
     const tmpMatch = s.match(
-      /^(?:\$\{(?:TMPDIR|TEMP|TMP)\}|\$(?:TMPDIR|TEMP|TMP)|%(?:TEMP|TMP)%|\$env:(?:TEMP|TMP))(?=$|[\\/])(.*)$/i
+      /^(?:\$\{(?:env:)?(?:TMPDIR|TEMP|TMP)\}|\$(?:env:)?(?:TMPDIR|TEMP|TMP)|%(?:TEMP|TMP)%)(?=$|[\\/])(.*)$/i
     );
     if (tmpMatch) {
-      const tail = (tmpMatch[1] || "").replace(/^[\\/]+/, "");
-      s = tail ? path.join(os.tmpdir(), tail) : os.tmpdir();
+      s = joinExpandedTail(os.tmpdir(), tmpMatch[1]);
+    } else {
+      const homeMatch = s.match(
+        /^(?:\$\{(?:env:)?(?:HOME|USERPROFILE)\}|\$(?:env:)?(?:HOME|USERPROFILE)|%(?:HOME|USERPROFILE)%)(?=$|[\\/])(.*)$/i
+      );
+      if (homeMatch) {
+        s = joinExpandedTail(os.homedir(), homeMatch[1]);
+      } else {
+        const localAppMatch = s.match(
+          /^(?:\$\{(?:env:)?LOCALAPPDATA\}|\$(?:env:)?LOCALAPPDATA|%LOCALAPPDATA%)(?=$|[\\/])(.*)$/i
+        );
+        if (localAppMatch) {
+          const base = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+          s = joinExpandedTail(base, localAppMatch[1]);
+        }
+      }
     }
   }
   return s;
@@ -393,7 +421,7 @@ export function createTools({
       const effectiveCode = expandedFile && typeof code === "string" && !code.trim() ? "" : code;
       const rawLang = typeof language === "string" ? language.trim() : "";
       const effectiveLanguage =
-        rawLang || (!effectiveCode && expandedFile ? inferLanguageFromFile(expandedFile) : "") || "shell";
+        rawLang || (expandedFile ? inferLanguageFromFile(expandedFile) : "") || "shell";
       const ws = resolveWs();
       const cwd = resolveCallCwd(argCwd, ws.cwd, {
         requireConfirmedWorkspace: true,

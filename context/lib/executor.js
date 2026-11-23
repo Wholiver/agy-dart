@@ -433,11 +433,106 @@ export function inferLanguageFromFile(filePath) {
   if (!filePath || typeof filePath !== "string") return "";
   const ext = path.extname(filePath.trim()).toLowerCase();
   if (ext === ".py" || ext === ".pyw") return "python";
-  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") return "javascript";
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".ts" || ext === ".mts" || ext === ".cts") {
+    return "javascript";
+  }
   if (ext === ".ps1") return "powershell";
   if (ext === ".bat" || ext === ".cmd") return process.platform === "win32" ? "cmd" : "shell";
   if (ext === ".sh" || ext === ".bash") return "shell";
   return "";
+}
+
+function hasUtf8OrUtf16Bom(buf) {
+  return (
+    Buffer.isBuffer(buf) &&
+    buf.length >= 2 &&
+    ((buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) ||
+      (buf[0] === 0xff && buf[1] === 0xfe) ||
+      (buf[0] === 0xfe && buf[1] === 0xff))
+  );
+}
+
+function needsUtf8BomStaging(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0 || hasUtf8OrUtf16Bom(buf)) return false;
+  let hasNonAscii = false;
+  for (let i = 0; i < buf.length; i += 1) {
+    if (buf[i] >= 0x80) {
+      hasNonAscii = true;
+      break;
+    }
+  }
+  if (!hasNonAscii) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isInsideOsTmpDir(dirPath) {
+  if (!dirPath) return false;
+  const norm = (p) => {
+    let r = path.resolve(p);
+    try {
+      r = fs.realpathSync(r);
+    } catch {}
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  const cand = norm(dirPath);
+  const tmp = norm(os.tmpdir());
+  const rel = path.relative(tmp, cand);
+  return (
+    rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !rel.startsWith("../") && !path.isAbsolute(rel))
+  );
+}
+
+function isEphemeralScriptStageDir(dirPath) {
+  if (!dirPath) return false;
+  if (isInsideOsTmpDir(dirPath)) return true;
+  const resolved = path.resolve(dirPath).replace(/\\/g, "/");
+  return /\/brain\/[^/]+\/scratch(?:\/|$)/i.test(resolved);
+}
+
+/** Coerce MCP array, JSON-stringified array, or scalar argument safely into string[] */
+export function normalizeExecArgs(rawArgs) {
+  if (Array.isArray(rawArgs)) {
+    return rawArgs.filter((a) => a !== undefined && a !== null).map((a) => String(a));
+  }
+  if (typeof rawArgs === "string") {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((a) => a !== undefined && a !== null).map((a) => String(a));
+        }
+      } catch {}
+    }
+    return [rawArgs];
+  }
+  if (rawArgs !== undefined && rawArgs !== null) {
+    return [String(rawArgs)];
+  }
+  return [];
+}
+
+function buildNodeFileExecArgs(scriptPath, safeArgs) {
+  const ext = path.extname(scriptPath).toLowerCase();
+  const [maj = 0, min = 0] = String(process.versions.node || "")
+    .split(".")
+    .map((n) => Number.parseInt(n, 10) || 0);
+  const flags = [];
+  if (ext === ".ts" || ext === ".mts" || ext === ".cts") {
+    if ((maj === 22 && min >= 6 && min < 18) || (maj === 23 && min < 6)) {
+      flags.push("--experimental-strip-types");
+    }
+  } else if (ext === ".js" && maj === 22 && min < 12) {
+    flags.push("--experimental-detect-module");
+  }
+  return [...flags, scriptPath, ...safeArgs];
 }
 
 /** Execute code in specified runtime (nodejs, python, shell, pwsh, cmd) */
@@ -451,25 +546,30 @@ export async function executeCode({
   env = {}
 }) {
   const rawLang = typeof language === "string" ? language.trim() : "";
-  const effectiveCode = file && typeof code === "string" && !code.trim() ? "" : code;
-  const inferredLang = !rawLang && !effectiveCode && file ? inferLanguageFromFile(file) : "";
+  const trimmedFile = typeof file === "string" ? file.trim() : "";
+  const safeCode = typeof code === "string" ? code : "";
+  const effectiveCode = trimmedFile && !safeCode.trim() ? "" : safeCode;
+  const inferredLang = !rawLang && trimmedFile ? inferLanguageFromFile(trimmedFile) : "";
   const normLang = (rawLang || inferredLang || "shell").toLowerCase();
   const workdir = cwd || process.cwd();
-  const safeArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  const safeArgs = normalizeExecArgs(args);
 
   // 1. Node.js
   if (normLang === "nodejs" || normLang === "node" || normLang === "javascript" || normLang === "js") {
-    if (file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       return runProcess({
         cmd: process.execPath,
-        args: [scriptPath, ...safeArgs],
+        args: buildNodeFileExecArgs(scriptPath, safeArgs),
         cwd: workdir,
         timeoutMs,
         env
       });
     }
-    const nodeFlags = isLikelyEsmCode(effectiveCode) ? ["--input-type=module", "-e", effectiveCode, "--", ...safeArgs] : ["-e", effectiveCode, "--", ...safeArgs];
+    const evalTail = safeArgs.length > 0 ? ["--", "[eval]", ...safeArgs] : [];
+    const nodeFlags = isLikelyEsmCode(effectiveCode)
+      ? ["--input-type=module", "-e", effectiveCode, ...evalTail]
+      : ["-e", effectiveCode, ...evalTail];
     return runProcess({
       cmd: process.execPath,
       args: nodeFlags,
@@ -487,8 +587,8 @@ export async function executeCode({
       PYTHONUTF8: "1",
       ...env
     };
-    if (file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       return runProcess({
         cmd: pythonBin,
         args: [scriptPath, ...safeArgs],
@@ -499,7 +599,7 @@ export async function executeCode({
     }
     return runProcess({
       cmd: pythonBin,
-      args: ["-c", code, ...safeArgs],
+      args: ["-c", effectiveCode, ...safeArgs],
       cwd: workdir,
       timeoutMs,
       env: pyEnv
@@ -548,9 +648,65 @@ export async function executeCode({
     if (!txt || !txt.trim() || hasLeadingPsParamBlock(txt)) return txt;
     return `${PS_UTF8_PRELUDE}\n${txt}`;
   };
+  const invokePowerShellFileWithUtf8 = (bin, targetScriptPath) => {
+    const psEnv = { ...env, __AGY_PS_FILE: targetScriptPath };
+    const clearTargets = ["Env:__AGY_PS_FILE"];
+    const psArgItems = safeArgs.map((arg, idx) => {
+      const key = `__AGY_PS_ARG_${idx}`;
+      psEnv[key] = arg;
+      clearTargets.push(`Env:${key}`);
+      return `$env:${key}`;
+    });
+    const wrapper =
+      `${PS_UTF8_PRELUDE} $__agyFile = $env:__AGY_PS_FILE; $__agyArgs = @(${psArgItems.join(", ")}); ` +
+      `Remove-Item ${clearTargets.join(", ")} -ErrorAction SilentlyContinue; ` +
+      `$global:LASTEXITCODE = $null; & $__agyFile @__agyArgs; ` +
+      `if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if (-not $?) { exit 1 }`;
+    return runProcess({
+      cmd: bin,
+      args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", wrapper],
+      cwd: workdir,
+      timeoutMs,
+      env: psEnv
+    });
+  };
+  const executePowerShellScriptFile = async (bin, scriptPath) => {
+    let stagedBomPs1 = "";
+    try {
+      let rawBuf = null;
+      try {
+        rawBuf = fs.readFileSync(scriptPath);
+      } catch {}
+      if (rawBuf && needsUtf8BomStaging(rawBuf)) {
+        const scriptDir = path.dirname(scriptPath);
+        const stageFileName = `agy-dart-psfile-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}.ps1`;
+        const bomBuf = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), rawBuf]);
+        const preferredDir = isEphemeralScriptStageDir(scriptDir) ? scriptDir : os.tmpdir();
+        try {
+          const candidate = path.join(preferredDir, stageFileName);
+          fs.writeFileSync(candidate, bomBuf, { mode: 0o600 });
+          stagedBomPs1 = candidate;
+        } catch {
+          if (preferredDir !== os.tmpdir()) {
+            const fallback = path.join(os.tmpdir(), stageFileName);
+            fs.writeFileSync(fallback, bomBuf, { mode: 0o600 });
+            stagedBomPs1 = fallback;
+          }
+        }
+      }
+      return await invokePowerShellFileWithUtf8(bin, stagedBomPs1 || scriptPath);
+    } finally {
+      if (stagedBomPs1) {
+        try {
+          fs.rmSync(stagedBomPs1, { force: true });
+        } catch {}
+      }
+    }
+  };
   const runPowerShellCommand = async (bin, scriptText) => {
     const psScript = scriptText || "";
-    if (safeArgs.length === 0) {
+    const leadingParam = hasLeadingPsParamBlock(psScript);
+    if (safeArgs.length === 0 && !leadingParam) {
       return runProcess({
         cmd: bin,
         args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", withPsUtf8Prelude(psScript)],
@@ -559,19 +715,13 @@ export async function executeCode({
         env
       });
     }
-    // Execute via ephemeral .ps1 file so literal safeArgs bind cleanly via -File, exit N & $LASTEXITCODE
-    // propagate accurately on both Windows PowerShell 5.1 and pwsh 7+, and zero __AGY_PS_* env vars leak.
+    // Execute via ephemeral UTF-8-BOM .ps1 + UTF-8 console prelude wrapper so literal safeArgs and
+    // leading param(...) blocks preserve UTF-8 stdout, exit N & $LASTEXITCODE with zero __AGY_PS_* leaks.
     let tmpPs1 = "";
     try {
       tmpPs1 = path.join(os.tmpdir(), `agy-dart-ps-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}.ps1`);
       fs.writeFileSync(tmpPs1, `\uFEFF${withPsUtf8Prelude(psScript)}`, { encoding: "utf8", mode: 0o600 });
-      return await runProcess({
-        cmd: bin,
-        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmpPs1, ...safeArgs],
-        cwd: workdir,
-        timeoutMs,
-        env
-      });
+      return await invokePowerShellFileWithUtf8(bin, tmpPs1);
     } catch {
       const psEnv = { ...env, __AGY_PS_CODE: psScript };
       const clearStmts = ["Remove-Item Env:__AGY_PS_CODE -ErrorAction SilentlyContinue"];
@@ -600,26 +750,20 @@ export async function executeCode({
 
   if (normLang === "pwsh" || normLang === "powershell") {
     const bin = process.platform === "win32" ? "powershell.exe" : "pwsh";
-    if (file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       if (process.platform === "win32" && /\.(?:bat|cmd)$/i.test(scriptPath)) {
         return runCmdBatchFile(scriptPath);
       }
-      return runProcess({
-        cmd: bin,
-        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...safeArgs],
-        cwd: workdir,
-        timeoutMs,
-        env
-      });
+      return executePowerShellScriptFile(bin, scriptPath);
     }
-    return runPowerShellCommand(bin, code);
+    return runPowerShellCommand(bin, effectiveCode);
   }
 
   // 4. Windows CMD
   if (normLang === "cmd" || normLang === "bat") {
-    if (!effectiveCode && file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       return runCmdBatchFile(scriptPath);
     }
     return runProcess({
@@ -633,24 +777,18 @@ export async function executeCode({
 
   // 5. Default Shell
   if (process.platform === "win32") {
-    if (!effectiveCode && file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       if (/\.(?:bat|cmd)$/i.test(scriptPath)) {
         return runCmdBatchFile(scriptPath);
       }
-      return runProcess({
-        cmd: "powershell.exe",
-        args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...safeArgs],
-        cwd: workdir,
-        timeoutMs,
-        env
-      });
+      return executePowerShellScriptFile("powershell.exe", scriptPath);
     }
     return runPowerShellCommand("powershell.exe", effectiveCode || "");
   } else {
     const shell = process.env.SHELL || "/bin/sh";
-    if (!effectiveCode && file) {
-      const scriptPath = path.isAbsolute(file) ? file : path.resolve(workdir, file);
+    if (trimmedFile) {
+      const scriptPath = path.isAbsolute(trimmedFile) ? trimmedFile : path.resolve(workdir, trimmedFile);
       return runProcess({
         cmd: shell,
         args: [scriptPath, ...safeArgs],

@@ -1451,12 +1451,26 @@ export function parseMaybeJsonObj(val) {
   return {};
 }
 
+function unwrapJsonQuotedString(val) {
+  if (typeof val !== "string") return "";
+  const trimmed = val.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === "string") return parsed.trim();
+    } catch {
+      return trimmed.slice(1, -1).trim();
+    }
+  }
+  return trimmed;
+}
+
 export function extractBareToolName(rawName) {
-  const name = String(rawName || "").trim();
+  const name = unwrapJsonQuotedString(String(rawName || ""));
   if (!name) return "";
   const colonIdx = name.lastIndexOf(":");
   const afterColon = colonIdx >= 0 ? name.slice(colonIdx + 1) : name;
-  const mcpMatch = afterColon.match(/^mcp_[^_]+_(.+)$/);
+  const mcpMatch = afterColon.match(/^mcp_+[^_]+_+(.+)$/);
   if (mcpMatch) {
     const tail = mcpMatch[1];
     const known = tail.match(
@@ -1498,8 +1512,8 @@ export function classifyToolExecutionKind(toolName, rawArgs = {}, options = {}) 
   const wasCallMcpTool = rawBare === "call_mcp_tool";
 
   if (wasCallMcpTool) {
-    const mcpTool = String(args.ToolName || args.toolName || "").trim();
-    const mcpServer = String(args.ServerName || args.serverName || "").trim();
+    const mcpTool = unwrapJsonQuotedString(String(args.ToolName || args.toolName || ""));
+    const mcpServer = unwrapJsonQuotedString(String(args.ServerName || args.serverName || ""));
     const mcpArgs = parseMaybeJsonObj(args.Arguments ?? args.arguments);
     effectiveName = mcpTool || (mcpServer ? `mcp:${mcpServer}` : "call_mcp_tool");
     effectiveArgs = mcpArgs;

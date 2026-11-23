@@ -752,11 +752,25 @@ function shortTargetLabel(rawPath, maxLen = 42) {
   return cleaned.slice(0, maxLen - 3) + "...";
 }
 
+function unwrapQuotedWrapperArg(val) {
+  if (typeof val !== "string") return "";
+  const trimmed = val.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === "string") return parsed.trim();
+    } catch {
+      return trimmed.slice(1, -1).trim();
+    }
+  }
+  return trimmed;
+}
+
 function unwrapEffectiveTool(call) {
-  const rawName = String(call?.name || "").trim();
+  const rawName = unwrapQuotedWrapperArg(String(call?.name || ""));
   const args = getCallArgs(call) || {};
   if (rawName === "call_mcp_tool") {
-    const mcpTool = String(args.ToolName ?? args.toolName ?? "").trim();
+    const mcpTool = unwrapQuotedWrapperArg(String(args.ToolName ?? args.toolName ?? ""));
     let mcpArgs = args.Arguments ?? args.arguments;
     if (typeof mcpArgs === "string") {
       try {
@@ -835,14 +849,14 @@ export function describeToolCall(call) {
     const o = Array.isArray(args.outlines) ? args.outlines.length : 0;
     const s = Array.isArray(args.slices) ? args.slices.length : 0;
     target = [o ? `${o} outlines` : "", s ? `${s} slices` : ""].filter(Boolean).join(", ");
-  } else if (bareTool === "ctx_execute") {
+  } else if (bareTool === "ctx_execute" || /(?:^|_)ctx_execute$/.test(bareTool)) {
     const intentLabel = [args.intent, args.summary, args.description].find(
       (v) => typeof v === "string" && v.trim()
     );
     target = shortTargetLabel(intentLabel || args.file || args.language || "shell", 36);
-  } else if (bareTool === "ctx_index") {
+  } else if (bareTool === "ctx_index" || /(?:^|_)ctx_index$/.test(bareTool)) {
     target = shortTargetLabel(args.url || args.path || args.label || "text", 36);
-  } else if (bareTool === "ctx_search") {
+  } else if (bareTool === "ctx_search" || /(?:^|_)ctx_search$/.test(bareTool)) {
     const qs = Array.isArray(args.queries) ? args.queries.join(",") : "";
     target = shortTargetLabel(qs, 36);
   } else if (args.Path || args.path || args.url || args.query) {
@@ -1888,7 +1902,7 @@ export function analyzeTranscriptCache(steps, options = {}) {
             if (e && e.path) invalidatePath(normPath(e.path, baseCwd));
           }
         } else if (name === "call_mcp_tool" && args) {
-          const mcpTool = String(args.ToolName ?? args.toolName ?? "").trim();
+          const mcpTool = unwrapQuotedWrapperArg(String(args.ToolName ?? args.toolName ?? ""));
           let mcpArgs = args.Arguments ?? args.arguments;
           if (typeof mcpArgs === "string") {
             try {
